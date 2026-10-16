@@ -2,6 +2,8 @@ import asyncio
 import logging
 import os
 import time
+from io import BytesIO
+from PIL import Image
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router, types as aiogram_types
 from aiogram.filters import Command
@@ -92,6 +94,18 @@ def get_main_menu_keyboard() -> InlineKeyboardMarkup:
         ]
     )
 
+def get_photo_result_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🔄 Еще вариант", callback_data="regen_photo"),
+            ],
+            [
+                InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_to_menu"),
+            ]
+        ]
+    )
+
 @router.message(Command("start"))
 async def cmd_start(message: aiogram_types.Message, state: FSMContext):
     user_id = message.from_user.id
@@ -107,6 +121,16 @@ async def cmd_start(message: aiogram_types.Message, state: FSMContext):
     )
     await state.clear()
     await message.answer(welcome_text, parse_mode="Markdown", reply_markup=get_main_menu_keyboard())
+    await state.set_state(CreationStates.waiting_for_media_type)
+
+@router.callback_query(F.data == "back_to_menu")
+async def process_back_to_menu(callback: aiogram_types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.clear()
+    await callback.message.edit_text(
+        "👇 **Выбери в меню ниже, что именно ты хочешь создать:**",
+        reply_markup=get_main_menu_keyboard()
+    )
     await state.set_state(CreationStates.waiting_for_media_type)
 
 @router.callback_query(F.data.in_(["create_photo", "create_video"]))
@@ -158,156 +182,4 @@ async def process_user_prompt(message: aiogram_types.Message, state: FSMContext)
             await message.answer(f"❌ Ошибка создания счета на оплату: {e}")
             return
 
-    await execute_generation(message, state, media_type, text_prompt)
-
-@router.pre_checkout_query()
-async def pre_checkout_query_handler(pre_checkout_query: PreCheckoutQuery):
-    await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
-
-@router.message(F.successful_payment)
-async def successful_payment_handler(message: aiogram_types.Message, state: FSMContext):
-    data = await state.get_data()
-    text_prompt = data.get("text_prompt")
-    media_type = data.get("media_type", "video")
-
-    if not text_prompt:
-        await message.answer("✅ Оплата прошла успешно! Но данные сессии устарели. Пожалуйста, повторите запрос через /start.")
-        return
-
-    await message.answer("✅ Оплата успешно получена! ⭐️ Запускаю генерацию...")
-    await execute_generation(message, state, media_type, text_prompt)
-
-async def execute_generation(message: aiogram_types.Message, state: FSMContext, media_type: str, text_prompt: str):
-    user_id = message.from_user.id
-    logging.info(f"📥 [{user_id}] Запуск процесса для {media_type}: «{text_prompt}»")
-    
-    if media_type == "video":
-        status_msg = await message.answer("🎬 **Шаг 1/2:** Создаю озвучку и запускаю генерацию видео через Veo...")
-        
-        audio_path = f"output_voice_{user_id}.mp3"
-        try:
-            communicate = edge_tts.Communicate(text_prompt, "ru-RU-SvetlanaNeural")
-            await communicate.save(audio_path)
-        except Exception as e:
-            logging.warning(f"⚠️ Не удалось создать аудио для видео: {e}")
-
-        video_filename = f"generated_video_{user_id}.mp4"
-
-        def generate_veo_video():
-            client = get_ai_client()
-            if not client:
-                raise ValueError("API-ключи Gemini недоступны.")
-
-            for attempt in range(len(GEMINI_KEYS) or 1):
-                try:
-                    logging.info(f"🎬 [{user_id}] Запрос к Veo (попытка {attempt + 1})...")
-                    operation = client.models.generate_videos(
-                        model="veo-3.1-generate-preview",
-                        source={"prompt": text_prompt},
-                    )
-                    while not operation.done:
-                        time.sleep(10)
-                        operation = client.operations.get(operation)
-                        logging.info(f"⏳ [{user_id}] Видео генерируется...")
-
-                    generated_video = operation.response.generated_videos[0]
-                    client.files.download(file=generated_video.video, destination=video_filename)
-                    return True
-                except Exception as e:
-                    err_str = str(e)
-                    if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                        logging.warning(f"⚠️ [{user_id}] Лимит ключа (429), ротация...")
-                        client = rotate_ai_client()
-                        if not client:
-                            break
-                    else:
-                        raise e
-            return False
-
-        try:
-            success = await asyncio.to_thread(generate_veo_video)
-            if success and os.path.exists(video_filename):
-                await message.answer_video(
-                    video=aiogram_types.FSInputFile(video_filename),
-                    caption=f"✨ Видео успешно создано по промпту:\n«{text_prompt}»",
-                    reply_markup=get_main_menu_keyboard()
-                )
-                os.remove(video_filename)
-            else:
-                await message.answer("❌ Не удалось сгенерировать видео из-за исчерпания лимитов API.", reply_markup=get_main_menu_keyboard())
-        except Exception as e:
-            logging.error(f"❌ [{user_id}] Ошибка Veo: {e}")
-            await message.answer(f"⚠️ **Ошибка при генерации видео:**\n`{e}`", parse_mode="Markdown", reply_markup=get_main_menu_keyboard())
-        finally:
-            if os.path.exists(audio_path):
-                os.remove(audio_path)
-
-    else:
-        status_msg = await message.answer("🖼 Создаю детальный концепт и описание изображения...")
-
-        def generate_photo_concept():
-            client = get_ai_client()
-            if not client:
-                raise ValueError("API-ключи Gemini недоступны.")
-
-            for attempt in range(len(GEMINI_KEYS) or 1):
-                try:
-                    interaction = client.interactions.create(
-                        model="gemini-3.5-flash-lite",
-                        input=f"Создай яркое, детальное и живописное визуальное описание (концепт) для художественной иллюстрации на тему: {text_prompt}"
-                    )
-                    if interaction and interaction.output_text:
-                        return interaction.output_text.strip()
-                except Exception as e:
-                    err_str = str(e)
-                    if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                        client = rotate_ai_client()
-                        if not client:
-                            break
-                    else:
-                        raise e
-            return f"Описание для запроса: {text_prompt}"
-
-        try:
-            concept_text = await asyncio.to_thread(generate_photo_concept)
-            await message.answer(
-                f"✨ **Результат генерации концепта:**\n\n{concept_text}",
-                parse_mode="Markdown",
-                reply_markup=get_main_menu_keyboard()
-            )
-        except Exception as e:
-            logging.error(f"❌ [{user_id}] Ошибка генерации концепта фото: {e}")
-            await message.answer(f"⚠️ **Ошибка:**\n`{e}`", parse_mode="Markdown", reply_markup=get_main_menu_keyboard())
-
-    try:
-        await status_msg.delete()
-    except Exception:
-        pass
-    
-    await state.clear()
-
-async def handle_ping(request):
-    return web.Response(text="Bot is running and awake!")
-
-async def web_server_runner():
-    app = web.Application()
-    app.router.add_get("/", handle_ping)
-    app.router.add_get("/ping", handle_ping)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    logging.info(f"🌐 HTTP-сервер для удержания от сна запущен на порту {PORT}")
-
-async def main():
-    await bot.delete_webhook(drop_pending_updates=True)
-    commands = [aiogram_types.BotCommand(command="start", description="Главное меню / Запуск")]
-    await bot.set_my_commands(commands)
-
-    dp.include_router(router)
-    await web_server_runner()
-    logging.info("🚀 Бот успешно запущен и ожидает сообщения (Long Polling)...")
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    await execute_generation(message, state
