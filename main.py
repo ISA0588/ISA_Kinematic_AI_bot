@@ -135,10 +135,9 @@ async def process_check_status(callback: aiogram_types.CallbackQuery):
                     status_report = "📊 **Статус систем (UptimeRobot):**\n\n"
                     for m in monitors:
                         name = m.get("friendly_name")
-                        # 2 = up, 9 = down, etc.
                         status_code = m.get("status")
                         status_str = "🟢 Работает (Up)" if status_code == 2.0 or status_code == 2 else "🔴 Спит / Ошибка (Down)"
-                        status_report.append(f"• **{name}**: {status_str}\n")
+                        status_report += f"• **{name}**: {status_str}\n"
                     
                     await callback.message.answer(status_report, parse_mode="Markdown")
                 else:
@@ -218,30 +217,18 @@ async def successful_payment_handler(message: aiogram_types.Message, state: FSMC
 async def execute_generation(message: aiogram_types.Message, state: FSMContext, media_type: str, text_prompt: str):
     user_id = message.from_user.id
     logging.info(f"📥 [{user_id}] Запуск процесса для {media_type}: «{text_prompt}»")
-    status_msg = await message.answer("🎙 **Шаг 1/2:** Генерирую бесплатную озвучку текста...")
-
-    audio_path = f"output_voice_{user_id}.mp3"
-    voice = "ru-RU-SvetlanaNeural"
-
-    try:
-        logging.info(f"🔊 [{user_id}] Запуск Edge-TTS...")
-        communicate = edge_tts.Communicate(text_prompt, voice)
-        await communicate.save(audio_path)
-        
-        await message.answer_audio(
-            audio=aiogram_types.FSInputFile(audio_path),
-            caption="🎙 Голосовая озвучка готова!"
-        )
-        logging.info(f"✅ [{user_id}] Озвучка успешно отправлена.")
-    except Exception as e:
-        logging.error(f"❌ [{user_id}] Ошибка TTS: {e}")
-        await message.answer(f"⚠️ Ошибка при создании озвучки: `{e}`", parse_mode="Markdown")
-    finally:
-        if os.path.exists(audio_path):
-            os.remove(audio_path)
-
+    
     if media_type == "video":
-        await status_msg.edit_text("🎬 **Шаг 2/2:** Запускаю генерацию видео через Veo (это может занять пару минут)...")
+        status_msg = await message.answer("🎬 **Шаг 1/2:** Создаю озвучку и запускаю генерацию видео через Veo...")
+        
+        # Генерируем аудио во внутренних целях (без отправки отдельным файлом в чат)
+        audio_path = f"output_voice_{user_id}.mp3"
+        try:
+            communicate = edge_tts.Communicate(text_prompt, "ru-RU-SvetlanaNeural")
+            await communicate.save(audio_path)
+        except Exception as e:
+            logging.warning(f"⚠️ Не удалось создать аудио для видео: {e}")
+
         video_filename = f"generated_video_{user_id}.mp4"
 
         def generate_veo_video():
@@ -289,13 +276,60 @@ async def execute_generation(message: aiogram_types.Message, state: FSMContext, 
         except Exception as e:
             logging.error(f"❌ [{user_id}] Ошибка Veo: {e}")
             await message.answer(f"⚠️ **Ошибка при генерации видео:**\n`{e}`", parse_mode="Markdown", reply_markup=get_main_menu_keyboard())
+        finally:
+            if os.path.exists(audio_path):
+                os.remove(audio_path)
 
     else:
-        await status_msg.edit_text("🖼 **Шаг 2/2:** Генерация изображений в разработке или настраивается...")
-        await message.answer(
-            f"✨ Промпт для фото принят: «{text_prompt}»",
-            reply_markup=get_main_menu_keyboard()
-        )
+        # Режим генерации фото (аудио не создается и не отправляется)
+        status_msg = await message.answer("🖼 Генерирую изображение по вашему промпту...")
+        photo_filename = f"generated_photo_{user_id}.jpg"
+
+        def generate_gemini_image():
+            client = get_ai_client()
+            if not client:
+                raise ValueError("API-ключи Gemini недоступны.")
+
+            for attempt in range(len(GEMINI_KEYS) or 1):
+                try:
+                    result = client.models.generate_images(
+                        model="imagen-3.0-generate-002",
+                        prompt=text_prompt,
+                        config=dict(
+                            number_of_images=1,
+                            output_mime_type="image/jpeg",
+                            aspect_ratio="1:1",
+                        ),
+                    )
+                    for generated_image in result.generated_images:
+                        image_bytes = generated_image.image.image_bytes
+                        with open(photo_filename, "wb") as f:
+                            f.write(image_bytes)
+                        return True
+                except Exception as e:
+                    err_str = str(e)
+                    if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                        client = rotate_ai_client()
+                        if not client:
+                            break
+                    else:
+                        raise e
+            return False
+
+        try:
+            success = await asyncio.to_thread(generate_gemini_image)
+            if success and os.path.exists(photo_filename):
+                await message.answer_photo(
+                    photo=aiogram_types.FSInputFile(photo_filename),
+                    caption=f"✨ Фото успешно создано по промпту:\n«{text_prompt}»",
+                    reply_markup=get_main_menu_keyboard()
+                )
+                os.remove(photo_filename)
+            else:
+                await message.answer("❌ Не удалось сгенерировать фото.", reply_markup=get_main_menu_keyboard())
+        except Exception as e:
+            logging.error(f"❌ [{user_id}] Ошибка генерации фото: {e}")
+            await message.answer(f"⚠️ **Ошибка:**\n`{e}`", parse_mode="Markdown", reply_markup=get_main_menu_keyboard())
 
     try:
         await status_msg.delete()
