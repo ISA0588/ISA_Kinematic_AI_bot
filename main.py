@@ -2,8 +2,6 @@ import asyncio
 import logging
 import os
 import time
-from io import BytesIO
-from PIL import Image
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router, types as aiogram_types
 from aiogram.filters import Command
@@ -231,8 +229,9 @@ async def execute_generation_photo_only(message: aiogram_types.Message, state: F
                     config=dict(number_of_images=1, output_mime_type="image/jpeg")
                 )
                 for generated_image in result.generated_images:
-                    image = Image.open(BytesIO(generated_image.image.image_bytes))
-                    image.save(photo_filename)
+                    # Сохраняем байты напрямую без PIL
+                    with open(photo_filename, "wb") as f:
+                        f.write(generated_image.image.image_bytes)
                     return True
             except Exception as e:
                 err_str = str(e)
