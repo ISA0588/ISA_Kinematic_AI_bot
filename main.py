@@ -237,7 +237,7 @@ async def execute_generation(message: aiogram_types.Message, state: FSMContext, 
             for attempt in range(len(GEMINI_KEYS) or 1):
                 try:
                     response = client.models.generate_content(
-                        model='gemini-2.5-flash',
+                        model='gemini-3.8-flash',
                         contents=f"Создай качественное видео на тему: {text_prompt}",
                         config=types.GenerateContentConfig(
                             response_modalities=["VIDEO"]
@@ -294,7 +294,7 @@ async def execute_generation(message: aiogram_types.Message, state: FSMContext, 
             for attempt in range(len(GEMINI_KEYS) or 1):
                 try:
                     response = client.models.generate_content(
-                        model='gemini-2.5-flash-image',
+                        model='gemini-3.8-flash',
                         contents=text_prompt,
                         config=types.GenerateContentConfig(
                             response_modalities=["IMAGE"]
@@ -320,7 +320,6 @@ async def execute_generation(message: aiogram_types.Message, state: FSMContext, 
             success = await asyncio.to_thread(generate_image_file)
             if success and os.path.exists(photo_filename):
                 await message.answer_photo(
-                    video=None,
                     photo=aiogram_types.FSInputFile(photo_filename),
                     caption=f"✨ Фото создано по промпту:\n«{text_prompt}»",
                     reply_markup=get_media_result_keyboard()
