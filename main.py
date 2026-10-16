@@ -59,6 +59,8 @@ if not TELEGRAM_BOT_TOKEN:
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
+
+# Создаем роутер и устанавливаем фильтр блокировки сообщений от других ботов
 router = Router()
 router.message.filter(F.from_user.is_bot == False)
 
@@ -100,7 +102,6 @@ async def process_media_choice(callback: aiogram_types.CallbackQuery, state: FSM
     user_id = callback.from_user.id
     choice = callback.data
     
-    # Сохраняем выбор пользователя в стейт
     media_type = "photo" if choice == "create_photo" else "video"
     await state.update_data(media_type=media_type)
     
@@ -149,7 +150,7 @@ async def process_user_prompt(message: aiogram_types.Message, state: FSMContext)
         if os.path.exists(audio_path):
             os.remove(audio_path)
 
-    # --- ЭТАП 2: Генерация контента (Фото или Видео) ---
+    # --- ЭТАП 2: Генерация контента (Видео) ---
     if media_type == "video":
         await status_msg.edit_text("🎬 **Шаг 2/2:** Запускаю генерацию видео через Veo (это может занять пару минут)...")
         video_filename = f"generated_video_{user_id}.mp4"
@@ -201,11 +202,9 @@ async def process_user_prompt(message: aiogram_types.Message, state: FSMContext)
             await message.answer(f"⚠️ **Ошибка при генерации видео:**\n`{e}`", parse_mode="Markdown", reply_markup=get_main_menu_keyboard())
 
     else:
-        # Режим генерации фото (например, через Imagen или Stable Diffusion API / Hugging Face)
         await status_msg.edit_text("🖼 **Шаг 2/2:** Генерация изображений в разработке или настраивается...")
-        # Здесь можно подключить генерацию фото через Hugging Face / Imagen
         await message.answer(
-            f"✨ Промпт для фото принят: «{text_prompt}»\n(Блок генерации изображений можно активировать следующим шагом).",
+            f"✨ Промпт для фото принят: «{text_prompt}»",
             reply_markup=get_main_menu_keyboard()
         )
 
@@ -216,7 +215,7 @@ async def process_user_prompt(message: aiogram_types.Message, state: FSMContext)
     
     await state.clear()
 
-# HTTP-сервер для Render
+# ==================== ВЕБ-СЕРВЕР ДЛЯ RENDER (PREVENT SLEEP) ====================
 async def handle_ping(request):
     return web.Response(text="Bot is running and awake!")
 
@@ -228,7 +227,7 @@ async def web_server_runner():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    logging.info(f"🌐 HTTP-сервер запущен на порту {PORT}")
+    logging.info(f"🌐 HTTP-сервер для удержания от сна запущен на порту {PORT}")
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
@@ -236,8 +235,11 @@ async def main():
     await bot.set_my_commands(commands)
 
     dp.include_router(router)
+    
+    # Запускаем локальный веб-сервер для предотвращения засыпания на Render
     await web_server_runner()
-    logging.info("🚀 Бот успешно запущен!")
+
+    logging.info("🚀 Бот успешно запущен и ожидает сообщения (Long Polling)...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
