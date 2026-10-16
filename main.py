@@ -7,7 +7,13 @@ from aiogram import Bot, Dispatcher, F, Router, types as aiogram_types
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    InlineKeyboardButton, 
+    InlineKeyboardMarkup, 
+    PreCheckoutQuery, 
+    LabeledPrice
+)
 from dotenv import load_dotenv
 import edge_tts
 from google import genai
@@ -17,6 +23,10 @@ load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 PORT = int(os.getenv("PORT", 10000))
+
+# Настройки платного/бесплатного доступа
+FREE_ACCESS_IDS = {8186927099, 1153214776, 7785086792, 1359780349}
+STAR_PRICE = 10
 
 logging.basicConfig(
     level=logging.INFO,
@@ -58,18 +68,17 @@ if not TELEGRAM_BOT_TOKEN:
     raise ValueError("❌ Не задан TELEGRAM_BOT_TOKEN!")
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
-dp = Dispatcher()
+# Используем MemoryStorage, чтобы состояния и данные (промпт) не терялись при оплате звезд
+dp = Dispatcher(storage=MemoryStorage())
 
-# Создаем роутер и устанавливаем фильтр блокировки сообщений от других ботов
 router = Router()
 router.message.filter(F.from_user.is_bot == False)
 
-# Состояния FSM для пошагового диалога
+# Состояния FSM
 class CreationStates(StatesGroup):
     waiting_for_media_type = State()
     waiting_for_prompt = State()
 
-# Главное меню выбора типа контента
 def get_main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -85,11 +94,12 @@ async def cmd_start(message: aiogram_types.Message, state: FSMContext):
     user_id = message.from_user.id
     logging.info(f"👤 Пользователь {user_id} запустил бота (/start)")
     
+    is_free = user_id in FREE_ACCESS_IDS
+    status_text = "⭐ У вас **БЕСПЛАТНЫЙ ДОСТУП**!" if is_free else f"💳 Стоимость генерации: **{STAR_PRICE} Telegram Stars**."
+
     welcome_text = (
-        "Привет! 👋 Я твой личный ИИ-помощник для генерации медиаконтента и озвучки.\n\n"
-        "🎯 **Что я умею:**\n"
-        "• Генерировать **фото** или **видео** по твоему текстовому описанию.\n"
-        "• Автоматически создавать качественную **голосовую озвучку (Edge TTS)**.\n\n"
+        f"Привет! 👋 Я твой личный ИИ-помощник для генерации контента и озвучки.\n\n"
+        f"{status_text}\n\n"
         "👇 **Выбери в меню ниже, что именно ты хочешь создать:**"
     )
     await state.clear()
@@ -110,7 +120,7 @@ async def process_media_choice(callback: aiogram_types.CallbackQuery, state: FSM
 
     await callback.message.edit_text(
         f"Отлично! Вы выбрали создание **{title}** 🚀\n\n"
-        "📝 Теперь отправьте мне **текстовое описание (промпт)**, что именно нужно изобразить или сгенерировать, и я озвучу этот текст!"
+        "📝 Теперь отправьте мне **текстовое описание (промпт)**, что именно нужно сгенерировать!"
     )
     await state.set_state(CreationStates.waiting_for_prompt)
 
@@ -123,10 +133,54 @@ async def process_user_prompt(message: aiogram_types.Message, state: FSMContext)
         await message.answer("⚠️ Пожалуйста, отправьте текстовое описание (промпт) для генерации.")
         return
 
+    await state.update_data(text_prompt=text_prompt)
     data = await state.get_data()
     media_type = data.get("media_type", "video")
 
-    logging.info(f"📥 [{user_id}] Получен промпт для {media_type}: «{text_prompt}»")
+    # Проверка на платный/бесплатный доступ
+    if user_id not in FREE_ACCESS_IDS:
+        try:
+            prices = [LabeledPrice(label="Генерация контента (AI Bot)", amount=STAR_PRICE)]
+            await bot.send_invoice(
+                chat_id=message.chat.id,
+                title="Оплата генерации контента",
+                description=f"Создание {media_type} по вашему промпту",
+                payload=f"gen_{media_type}_{user_id}_{int(time.time())}",
+                currency="XTR",  # Telegram Stars
+                prices=prices
+            )
+            await message.answer(f"⭐️ Стоимость генерации: {STAR_PRICE} звезд.\nПожалуйста, подтвердите оплату выше 👆")
+            return
+        except Exception as e:
+            logging.error(f"Ошибка создания счета: {e}")
+            await message.answer(f"❌ Ошибка создания счета на оплату: {e}")
+            return
+
+    # Если пользователь в списке бесплатных — сразу запускаем генерацию
+    await execute_generation(message, state, media_type, text_prompt)
+
+# Обработка предварительного запроса оплаты (обязательно для Telegram Stars)
+@router.pre_checkout_query()
+async def pre_checkout_query_handler(pre_checkout_query: PreCheckoutQuery):
+    await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
+
+# Обработка успешной оплаты
+@router.message(F.successful_payment)
+async def successful_payment_handler(message: aiogram_types.Message, state: FSMContext):
+    data = await state.get_data()
+    text_prompt = data.get("text_prompt")
+    media_type = data.get("media_type", "video")
+
+    if not text_prompt:
+        await message.answer("✅ Оплата прошла успешно! Но данные сессии устарели. Пожалуйста, повторите запрос через /start.")
+        return
+
+    await message.answer("✅ Оплата успешно получена! ⭐️ Запускаю генерацию...")
+    await execute_generation(message, state, media_type, text_prompt)
+
+async def execute_generation(message: aiogram_types.Message, state: FSMContext, media_type: str, text_prompt: str):
+    user_id = message.from_user.id
+    logging.info(f"📥 [{user_id}] Запуск процесса для {media_type}: «{text_prompt}»")
     status_msg = await message.answer("🎙 **Шаг 1/2:** Генерирую бесплатную озвучку текста...")
 
     # --- ЭТАП 1: Озвучка текста (Edge TTS) ---
@@ -150,7 +204,7 @@ async def process_user_prompt(message: aiogram_types.Message, state: FSMContext)
         if os.path.exists(audio_path):
             os.remove(audio_path)
 
-    # --- ЭТАП 2: Генерация контента (Видео) ---
+    # --- ЭТАП 2: Генерация контента (Видео или Фото) ---
     if media_type == "video":
         await status_msg.edit_text("🎬 **Шаг 2/2:** Запускаю генерацию видео через Veo (это может занять пару минут)...")
         video_filename = f"generated_video_{user_id}.mp4"
@@ -235,10 +289,7 @@ async def main():
     await bot.set_my_commands(commands)
 
     dp.include_router(router)
-    
-    # Запускаем локальный веб-сервер для предотвращения засыпания на Render
     await web_server_runner()
-
     logging.info("🚀 Бот успешно запущен и ожидает сообщения (Long Polling)...")
     await dp.start_polling(bot)
 
