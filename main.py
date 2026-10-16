@@ -35,7 +35,14 @@ logging.basicConfig(
 
 # Собираем ключи Gemini для ротации
 GEMINI_KEYS = []
-for key_name in ["GEMINI_API_KEY", "GEMINI_API_KEY2", "GEMINI_API_KEY3", "GEMINI_API_KEYS"]:
+for key_name in [
+    "GEMINI_API_KEY", 
+    "GEMINI_API_KEY2", 
+    "GEMINI_API_KEY3", 
+    "GEMINI_API_KEY4", 
+    "GEMINI_API_KEY5", 
+    "GEMINI_API_KEYS"
+]:
     val = os.getenv(key_name, "")
     if val:
         for k in val.split(","):
@@ -196,7 +203,6 @@ async def execute_generation(message: aiogram_types.Message, state: FSMContext, 
             for attempt in range(len(GEMINI_KEYS) or 1):
                 try:
                     logging.info(f"🎬 [{user_id}] Запрос к Veo (попытка {attempt + 1})...")
-                    # Актуальный вызов через source согласно рекомендациям SDK
                     operation = client.models.generate_videos(
                         model="veo-3.1-generate-preview",
                         source={"prompt": text_prompt},
@@ -248,7 +254,6 @@ async def execute_generation(message: aiogram_types.Message, state: FSMContext, 
 
             for attempt in range(len(GEMINI_KEYS) or 1):
                 try:
-                    # Используем модель gemini-3.5-flash-lite из документации
                     interaction = client.interactions.create(
                         model="gemini-3.5-flash-lite",
                         input=f"Создай яркое, детальное и живописное визуальное описание (концепт) для художественной иллюстрации на тему: {text_prompt}"
@@ -308,4 +313,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-```[cite: 13]
