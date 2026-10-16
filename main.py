@@ -200,21 +200,19 @@ async def execute_generation(message: aiogram_types.Message, state: FSMContext, 
 
             for attempt in range(len(GEMINI_KEYS) or 1):
                 try:
-                    logging.info(f"🎬 [{user_id}] Проверка ключа через gemini-1.5-flash (попытка {attempt + 1})...")
-                    
-                    # Временный тестовый запрос для проверки валидности API-ключа
-                    response = client.models.generate_content(
-                        model="gemini-1.5-flash",
-                        contents=f"Напиши короткий сценарий для видео на тему: {text_prompt}"
+                    logging.info(f"🎬 [{user_id}] Запрос к Veo (попытка {attempt + 1})...")
+                    operation = client.models.generate_videos(
+                        model="veo-3.1-generate-preview",
+                        source={"prompt": text_prompt},
                     )
-                    
-                    logging.info(f"✅ Успех! Ключ рабочий, ответ получен: {response.text[:100]}...")
-                    
-                    # Создаем временно файл сценария для проверки работы отправки
-                    with open(video_filename, "w", encoding="utf-8") as f:
-                        f.write(f"Тестовый файл сценария для видео: {response.text}")
-                    return True
+                    while not operation.done:
+                        time.sleep(10)
+                        operation = client.operations.get(operation)
+                        logging.info(f"⏳ [{user_id}] Видео генерируется...")
 
+                    generated_video = operation.response.generated_videos[0]
+                    client.files.download(file=generated_video.video, destination=video_filename)
+                    return True
                 except Exception as e:
                     err_str = str(e)
                     if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
