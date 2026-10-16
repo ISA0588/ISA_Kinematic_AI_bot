@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import time
-from aiohttp import web
+from aiohttp import web, ClientSession
 from aiogram import Bot, Dispatcher, F, Router, types as aiogram_types
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -23,6 +23,7 @@ load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 PORT = int(os.getenv("PORT", 10000))
+UPTIMEROBOT_API_KEY = os.getenv("UPTIMEROBOT_API_KEY", "")
 
 # Настройки платного/бесплатного доступа
 FREE_ACCESS_IDS = {8186927099, 1153214776, 7785086792, 1359780349}
@@ -68,13 +69,11 @@ if not TELEGRAM_BOT_TOKEN:
     raise ValueError("❌ Не задан TELEGRAM_BOT_TOKEN!")
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
-# Используем MemoryStorage, чтобы состояния и данные (промпт) не терялись при оплате звезд
 dp = Dispatcher(storage=MemoryStorage())
 
 router = Router()
 router.message.filter(F.from_user.is_bot == False)
 
-# Состояния FSM
 class CreationStates(StatesGroup):
     waiting_for_media_type = State()
     waiting_for_prompt = State()
@@ -85,6 +84,9 @@ def get_main_menu_keyboard() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(text="🖼 Создать Фото (ИИ)", callback_data="create_photo"),
                 InlineKeyboardButton(text="🎬 Создать Видео (ИИ)", callback_data="create_video"),
+            ],
+            [
+                InlineKeyboardButton(text="📊 Статус сервера", callback_data="check_status")
             ]
         ]
     )
@@ -105,6 +107,45 @@ async def cmd_start(message: aiogram_types.Message, state: FSMContext):
     await state.clear()
     await message.answer(welcome_text, parse_mode="Markdown", reply_markup=get_main_menu_keyboard())
     await state.set_state(CreationStates.waiting_for_media_type)
+
+# Обработчик проверки статуса через UptimeRobot API
+@router.callback_query(F.data == "check_status")
+async def process_check_status(callback: aiogram_types.CallbackQuery):
+    await callback.answer("Запрашиваю статус серверов...")
+    if not UPTIMEROBOT_API_KEY:
+        await callback.message.answer("⚠️ API-ключ UptimeRobot не настроен в переменных окружения.")
+        return
+
+    url = "https://api.uptimerobot.com/v2/getMonitors"
+    payload = {
+        "api_key": UPTIMEROBOT_API_KEY,
+        "format": "json"
+    }
+    
+    try:
+        async with ClientSession() as session:
+            async with session.post(url, data=payload) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    monitors = data.get("monitors", [])
+                    if not monitors:
+                        await callback.message.answer("📭 Активных мониторов в UptimeRobot не найдено.")
+                        return
+                    
+                    status_report = "📊 **Статус систем (UptimeRobot):**\n\n"
+                    for m in monitors:
+                        name = m.get("friendly_name")
+                        # 2 = up, 9 = down, etc.
+                        status_code = m.get("status")
+                        status_str = "🟢 Работает (Up)" if status_code == 2.0 or status_code == 2 else "🔴 Спит / Ошибка (Down)"
+                        status_report.append(f"• **{name}**: {status_str}\n")
+                    
+                    await callback.message.answer(status_report, parse_mode="Markdown")
+                else:
+                    await callback.message.answer("❌ Не удалось получить данные от UptimeRobot API.")
+    except Exception as e:
+        logging.error(f"Ошибка запроса к UptimeRobot API: {e}")
+        await callback.message.answer("⚠️ Произошла ошибка при обращении к сервису мониторинга.")
 
 @router.callback_query(F.data.in_(["create_photo", "create_video"]))
 async def process_media_choice(callback: aiogram_types.CallbackQuery, state: FSMContext):
@@ -137,7 +178,6 @@ async def process_user_prompt(message: aiogram_types.Message, state: FSMContext)
     data = await state.get_data()
     media_type = data.get("media_type", "video")
 
-    # Проверка на платный/бесплатный доступ
     if user_id not in FREE_ACCESS_IDS:
         try:
             prices = [LabeledPrice(label="Генерация контента (AI Bot)", amount=STAR_PRICE)]
@@ -146,7 +186,7 @@ async def process_user_prompt(message: aiogram_types.Message, state: FSMContext)
                 title="Оплата генерации контента",
                 description=f"Создание {media_type} по вашему промпту",
                 payload=f"gen_{media_type}_{user_id}_{int(time.time())}",
-                currency="XTR",  # Telegram Stars
+                currency="XTR",
                 prices=prices
             )
             await message.answer(f"⭐️ Стоимость генерации: {STAR_PRICE} звезд.\nПожалуйста, подтвердите оплату выше 👆")
@@ -156,15 +196,12 @@ async def process_user_prompt(message: aiogram_types.Message, state: FSMContext)
             await message.answer(f"❌ Ошибка создания счета на оплату: {e}")
             return
 
-    # Если пользователь в списке бесплатных — сразу запускаем генерацию
     await execute_generation(message, state, media_type, text_prompt)
 
-# Обработка предварительного запроса оплаты (обязательно для Telegram Stars)
 @router.pre_checkout_query()
 async def pre_checkout_query_handler(pre_checkout_query: PreCheckoutQuery):
     await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
 
-# Обработка успешной оплаты
 @router.message(F.successful_payment)
 async def successful_payment_handler(message: aiogram_types.Message, state: FSMContext):
     data = await state.get_data()
@@ -183,7 +220,6 @@ async def execute_generation(message: aiogram_types.Message, state: FSMContext, 
     logging.info(f"📥 [{user_id}] Запуск процесса для {media_type}: «{text_prompt}»")
     status_msg = await message.answer("🎙 **Шаг 1/2:** Генерирую бесплатную озвучку текста...")
 
-    # --- ЭТАП 1: Озвучка текста (Edge TTS) ---
     audio_path = f"output_voice_{user_id}.mp3"
     voice = "ru-RU-SvetlanaNeural"
 
@@ -204,7 +240,6 @@ async def execute_generation(message: aiogram_types.Message, state: FSMContext, 
         if os.path.exists(audio_path):
             os.remove(audio_path)
 
-    # --- ЭТАП 2: Генерация контента (Видео или Фото) ---
     if media_type == "video":
         await status_msg.edit_text("🎬 **Шаг 2/2:** Запускаю генерацию видео через Veo (это может занять пару минут)...")
         video_filename = f"generated_video_{user_id}.mp4"
@@ -269,7 +304,6 @@ async def execute_generation(message: aiogram_types.Message, state: FSMContext, 
     
     await state.clear()
 
-# ==================== ВЕБ-СЕРВЕР ДЛЯ RENDER (PREVENT SLEEP) ====================
 async def handle_ping(request):
     return web.Response(text="Bot is running and awake!")
 
