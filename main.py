@@ -7,21 +7,23 @@ from aiogram import Bot, Dispatcher, F, Router, types as aiogram_types
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from dotenv import load_dotenv
 import edge_tts
-from deep_translator import GoogleTranslator, DeeplTranslator
-from gtts import gTTS
 from google import genai
-from google.genai import types as genai_types
 
-# Загружаем переменные окружения из .env файла
+# Загружаем переменные окружения
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 PORT = int(os.getenv("PORT", 10000))
-DEEPL_API_KEY = os.getenv("DEEPL_API_KEY", "")
 
-# Собираем ключи Gemini для автоматической ротации (GEMINI_API_KEY, GEMINI_API_KEY2, GEMINI_API_KEY3)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+# Собираем ключи Gemini для ротации
 GEMINI_KEYS = []
 for key_name in ["GEMINI_API_KEY", "GEMINI_API_KEY2", "GEMINI_API_KEY3", "GEMINI_API_KEYS"]:
     val = os.getenv(key_name, "")
@@ -36,127 +38,185 @@ current_key_index = 0
 def get_ai_client():
     global current_key_index
     if not GEMINI_KEYS:
+        logging.error("❌ Не найдено ни одного ключа Gemini!")
         return None
     key = GEMINI_KEYS[current_key_index]
     try:
         return genai.Client(api_key=key)
     except Exception as e:
-        logging.warning(f"Не удалось инициализировать GenAI клиента с ключом #{current_key_index + 1}: {e}")
+        logging.warning(f"⚠️ Не удалось инициализировать GenAI клиента с ключом #{current_key_index + 1}: {e}")
         return None
 
 def rotate_ai_client():
     global current_key_index
     if len(GEMINI_KEYS) > 1:
         current_key_index = (current_key_index + 1) % len(GEMINI_KEYS)
-        logging.info(f"🔄 Переключение на запасной ключ Gemini #{current_key_index + 1}")
+        logging.info(f"🔄 [РОТАЦИЯ] Переключение на ключ Gemini #{current_key_index + 1}")
     return get_ai_client()
 
 if not TELEGRAM_BOT_TOKEN:
-    raise ValueError("❌ Ошибка: Не задан TELEGRAM_BOT_TOKEN в файле .env!")
+    raise ValueError("❌ Не задан TELEGRAM_BOT_TOKEN!")
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
-
-# Создаем роутер и фильтруем сообщения от других ботов
 router = Router()
 router.message.filter(F.from_user.is_bot == False)
 
-logging.basicConfig(level=logging.INFO)
+# Состояния FSM для пошагового диалога
+class CreationStates(StatesGroup):
+    waiting_for_media_type = State()
+    waiting_for_prompt = State()
 
-class CreateMedia(StatesGroup):
-    waiting_for_content = State()
+# Главное меню выбора типа контента
+def get_main_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🖼 Создать Фото (ИИ)", callback_data="create_photo"),
+                InlineKeyboardButton(text="🎬 Создать Видео (ИИ)", callback_data="create_video"),
+            ]
+        ]
+    )
 
 @router.message(Command("start"))
 async def cmd_start(message: aiogram_types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    logging.info(f"👤 Пользователь {user_id} запустил бота (/start)")
+    
     welcome_text = (
-        "Привет! 👋 Я ИИ-бот для создания видео и озвучки.\n\n"
-        "🎬 **Что я умею:**\n"
-        "• Озвучивать текст голосом с помощью **Edge TTS**.\n"
-        "• Генерировать кинематографичные видео по описанию с помощью модели **Google Veo**.\n\n"
-        "📌 **Как пользоваться:**\n"
-        "Отправьте мне текстовое описание (промпт) или прикрепите фото/видео с подписью."
+        "Привет! 👋 Я твой личный ИИ-помощник для генерации медиаконтента и озвучки.\n\n"
+        "🎯 **Что я умею:**\n"
+        "• Генерировать **фото** или **видео** по твоему текстовому описанию.\n"
+        "• Автоматически создавать качественную **голосовую озвучку (Edge TTS)**.\n\n"
+        "👇 **Выбери в меню ниже, что именно ты хочешь создать:**"
     )
-    await message.answer(welcome_text, parse_mode="Markdown")
-    await state.set_state(CreateMedia.waiting_for_content)
+    await state.clear()
+    await message.answer(welcome_text, parse_mode="Markdown", reply_markup=get_main_menu_keyboard())
+    await state.set_state(CreationStates.waiting_for_media_type)
 
-@router.message(CreateMedia.waiting_for_content)
-async def handle_media_creation(message: aiogram_types.Message, state: FSMContext):
+@router.callback_query(F.data.in_(["create_photo", "create_video"]))
+async def process_media_choice(callback: aiogram_types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    user_id = callback.from_user.id
+    choice = callback.data
+    
+    # Сохраняем выбор пользователя в стейт
+    media_type = "photo" if choice == "create_photo" else "video"
+    await state.update_data(media_type=media_type)
+    
+    title = "фото" if media_type == "photo" else "видео"
+    logging.info(f"🔘 Пользователь {user_id} выбрал режим создания: {media_type}")
+
+    await callback.message.edit_text(
+        f"Отлично! Вы выбрали создание **{title}** 🚀\n\n"
+        "📝 Теперь отправьте мне **текстовое описание (промпт)**, что именно нужно изобразить или сгенерировать, и я озвучу этот текст!"
+    )
+    await state.set_state(CreationStates.waiting_for_prompt)
+
+@router.message(CreationStates.waiting_for_prompt)
+async def process_user_prompt(message: aiogram_types.Message, state: FSMContext):
+    user_id = message.from_user.id
     text_prompt = message.caption or message.text
 
     if not text_prompt or text_prompt.startswith("/"):
-        await message.answer("Пожалуйста, отправьте текстовое описание для генерации видео и озвучки.")
+        await message.answer("⚠️ Пожалуйста, отправьте текстовое описание (промпт) для генерации.")
         return
 
+    data = await state.get_data()
+    media_type = data.get("media_type", "video")
+
+    logging.info(f"📥 [{user_id}] Получен промпт для {media_type}: «{text_prompt}»")
     status_msg = await message.answer("🎙 **Шаг 1/2:** Генерирую бесплатную озвучку текста...")
 
-    # 1. Генерация озвучки через Edge TTS
-    audio_path = f"output_voice_{message.from_user.id}.mp3"
+    # --- ЭТАП 1: Озвучка текста (Edge TTS) ---
+    audio_path = f"output_voice_{user_id}.mp3"
     voice = "ru-RU-SvetlanaNeural"
 
     try:
+        logging.info(f"🔊 [{user_id}] Запуск Edge-TTS...")
         communicate = edge_tts.Communicate(text_prompt, voice)
         await communicate.save(audio_path)
+        
         await message.answer_audio(
             audio=aiogram_types.FSInputFile(audio_path),
             caption="🎙 Голосовая озвучка готова!"
         )
+        logging.info(f"✅ [{user_id}] Озвучка успешно отправлена.")
     except Exception as e:
-        logging.error(f"Ошибка TTS: {e}")
-        await message.answer("⚠️ Не удалось создать озвучку.")
+        logging.error(f"❌ [{user_id}] Ошибка TTS: {e}")
+        await message.answer(f"⚠️ Ошибка при создании озвучки: `{e}`", parse_mode="Markdown")
     finally:
         if os.path.exists(audio_path):
             os.remove(audio_path)
 
-    # 2. Генерация видео через Veo API (Google GenAI) с ротацией ключей
-    await status_msg.edit_text("🎬 **Шаг 2/2:** Запускаю генерацию видео через Veo (это может занять пару минут)...")
-    video_filename = f"generated_video_{message.from_user.id}.mp4"
+    # --- ЭТАП 2: Генерация контента (Фото или Видео) ---
+    if media_type == "video":
+        await status_msg.edit_text("🎬 **Шаг 2/2:** Запускаю генерацию видео через Veo (это может занять пару минут)...")
+        video_filename = f"generated_video_{user_id}.mp4"
 
-    def generate_veo_video():
-        client = get_ai_client()
-        if not client:
-            raise ValueError("API-ключи Gemini/GenAI не настроены.")
+        def generate_veo_video():
+            client = get_ai_client()
+            if not client:
+                raise ValueError("API-ключи Gemini недоступны.")
 
-        for _ in range(len(GEMINI_KEYS) or 1):
-            try:
-                operation = client.models.generate_videos(
-                    model="veo-3.1-generate-preview",
-                    prompt=text_prompt,
+            for attempt in range(len(GEMINI_KEYS) or 1):
+                try:
+                    logging.info(f"🎬 [{user_id}] Запрос к Veo (попытка {attempt + 1})...")
+                    operation = client.models.generate_videos(
+                        model="veo-3.1-generate-preview",
+                        prompt=text_prompt,
+                    )
+                    while not operation.done:
+                        time.sleep(10)
+                        operation = client.operations.get(operation)
+                        logging.info(f"⏳ [{user_id}] Видео генерируется...")
+
+                    generated_video = operation.response.generated_videos[0]
+                    client.files.download(file=generated_video.video, destination=video_filename)
+                    return True
+                except Exception as e:
+                    err_str = str(e)
+                    if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                        logging.warning(f"⚠️ [{user_id}] Лимит ключа (429), ротация...")
+                        client = rotate_ai_client()
+                        if not client:
+                            break
+                    else:
+                        raise e
+            return False
+
+        try:
+            success = await asyncio.to_thread(generate_veo_video)
+            if success and os.path.exists(video_filename):
+                await message.answer_video(
+                    video=aiogram_types.FSInputFile(video_filename),
+                    caption=f"✨ Видео успешно создано по промпту:\n«{text_prompt}»",
+                    reply_markup=get_main_menu_keyboard()
                 )
-                while not operation.done:
-                    time.sleep(10)
-                    operation = client.operations.get(operation)
+                os.remove(video_filename)
+            else:
+                await message.answer("❌ Не удалось сгенерировать видео из-за исчерпания лимитов API.", reply_markup=get_main_menu_keyboard())
+        except Exception as e:
+            logging.error(f"❌ [{user_id}] Ошибка Veo: {e}")
+            await message.answer(f"⚠️ **Ошибка при генерации видео:**\n`{e}`", parse_mode="Markdown", reply_markup=get_main_menu_keyboard())
 
-                generated_video = operation.response.generated_videos[0]
-                client.files.download(file=generated_video.video, destination=video_filename)
-                return True
-            except Exception as e:
-                err_str = str(e)
-                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                    logging.warning(f"Лимит ключа исчерпан, ротация ключа Gemini... Ошибка: {e}")
-                    client = rotate_ai_client()
-                    if not client:
-                        break
-                else:
-                    raise e
-        return False
+    else:
+        # Режим генерации фото (например, через Imagen или Stable Diffusion API / Hugging Face)
+        await status_msg.edit_text("🖼 **Шаг 2/2:** Генерация изображений в разработке или настраивается...")
+        # Здесь можно подключить генерацию фото через Hugging Face / Imagen
+        await message.answer(
+            f"✨ Промпт для фото принят: «{text_prompt}»\n(Блок генерации изображений можно активировать следующим шагом).",
+            reply_markup=get_main_menu_keyboard()
+        )
 
     try:
-        success = await asyncio.to_thread(generate_veo_video)
-        if success and os.path.exists(video_filename):
-            await message.answer_video(
-                video=aiogram_types.FSInputFile(video_filename),
-                caption=f"✨ Видео успешно создано по промпту:\n«{text_prompt}»"
-            )
-            os.remove(video_filename)
-        else:
-            await message.answer("❌ Не удалось сгенерировать видео из-за исчерпания лимитов API.")
-    except Exception as e:
-        logging.error(f"Ошибка Veo: {e}")
-        await message.answer(f"⚠️ Ошибка при создании видео: {e}")
+        await status_msg.delete()
+    except Exception:
+        pass
+    
+    await state.clear()
 
-    await status_msg.delete()
-
-# HTTP-сервер для поддержки активности бота на Render (Prevent Sleep)
+# HTTP-сервер для Render
 async def handle_ping(request):
     return web.Response(text="Bot is running and awake!")
 
@@ -172,15 +232,12 @@ async def web_server_runner():
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
-
-    commands = [
-        aiogram_types.BotCommand(command="start", description="Запустить бота и сгенерировать видео")
-    ]
+    commands = [aiogram_types.BotCommand(command="start", description="Главное меню / Запуск")]
     await bot.set_my_commands(commands)
 
     dp.include_router(router)
     await web_server_runner()
-    logging.info("🚀 Запуск бота через Long Polling...")
+    logging.info("🚀 Бот успешно запущен!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
