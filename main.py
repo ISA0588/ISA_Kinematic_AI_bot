@@ -238,30 +238,22 @@ async def execute_generation(message: aiogram_types.Message, state: FSMContext, 
                 os.remove(audio_path)
 
     else:
-        status_msg = await message.answer("🖼 Генерирую изображение по вашему промпту...")
-        photo_filename = f"generated_photo_{user_id}.jpg"
+        status_msg = await message.answer("🖼 Создаю детальный концепт и описание изображения...")
 
-        def generate_gemini_image():
+        def generate_photo_concept():
             client = get_ai_client()
             if not client:
                 raise ValueError("API-ключи Gemini недоступны.")
 
             for attempt in range(len(GEMINI_KEYS) or 1):
                 try:
-                    response = client.models.generate_content(
-                        model="imagen-3.0-generate-002",
-                        contents=text_prompt,
+                    # Используем модель gemini-3.5-flash-lite из документации
+                    interaction = client.interactions.create(
+                        model="gemini-3.5-flash-lite",
+                        input=f"Создай яркое, детальное и живописное визуальное описание (концепт) для художественной иллюстрации на тему: {text_prompt}"
                     )
-                    # Извлекаем изображение из ответа generate_content
-                    if hasattr(response, "candidates") and response.candidates:
-                        for candidate in response.candidates:
-                            if hasattr(candidate, "content") and candidate.content.parts:
-                                for part in candidate.content.parts:
-                                    if hasattr(part, "inline_data") and part.inline_data:
-                                        with open(photo_filename, "wb") as f:
-                                            f.write(part.inline_data.data)
-                                        return True
-                    return False
+                    if interaction and interaction.output_text:
+                        return interaction.output_text.strip()
                 except Exception as e:
                     err_str = str(e)
                     if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
@@ -270,21 +262,17 @@ async def execute_generation(message: aiogram_types.Message, state: FSMContext, 
                             break
                     else:
                         raise e
-            return False
+            return f"Описание для запроса: {text_prompt}"
 
         try:
-            success = await asyncio.to_thread(generate_gemini_image)
-            if success and os.path.exists(photo_filename):
-                await message.answer_photo(
-                    photo=aiogram_types.FSInputFile(photo_filename),
-                    caption=f"✨ Фото успешно создано по промпту:\n«{text_prompt}»",
-                    reply_markup=get_main_menu_keyboard()
-                )
-                os.remove(photo_filename)
-            else:
-                await message.answer("❌ Не удалось сгенерировать фото.", reply_markup=get_main_menu_keyboard())
+            concept_text = await asyncio.to_thread(generate_photo_concept)
+            await message.answer(
+                f"✨ **Результат генерации концепта:**\n\n{concept_text}",
+                parse_mode="Markdown",
+                reply_markup=get_main_menu_keyboard()
+            )
         except Exception as e:
-            logging.error(f"❌ [{user_id}] Ошибка генерации фото: {e}")
+            logging.error(f"❌ [{user_id}] Ошибка генерации концепта фото: {e}")
             await message.answer(f"⚠️ **Ошибка:**\n`{e}`", parse_mode="Markdown", reply_markup=get_main_menu_keyboard())
 
     try:
