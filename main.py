@@ -24,6 +24,10 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 PORT = int(os.getenv("PORT", 10000))
 
+# Загружаем дополнительные API-ключи из панели окружения
+DEEPL_API_KEY = os.getenv("DEEPL_API_KEY", "")
+UPTIMEROBOT_API_KEY = os.getenv("UPTIMEROBOT_API_KEY", "")
+
 # Настройки платного/бесплатного доступа
 FREE_ACCESS_IDS = {8186927099, 1153214776, 7785086792, 1359780349}
 STAR_PRICE = 10
@@ -33,22 +37,16 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-# Собираем ключи Gemini для ротации
+# Автоматически собираем все ключи Gemini для ротации
 GEMINI_KEYS = []
-for key_name in [
-    "GEMINI_API_KEY", 
-    "GEMINI_API_KEY2", 
-    "GEMINI_API_KEY3", 
-    "GEMINI_API_KEY4", 
-    "GEMINI_API_KEY5", 
-    "GEMINI_API_KEYS"
-]:
-    val = os.getenv(key_name, "")
-    if val:
+for key_name, val in os.environ.items():
+    if key_name.startswith("GEMINI_API_KEY") and val:
         for k in val.split(","):
             clean_k = k.strip()
             if clean_k and clean_k not in GEMINI_KEYS:
                 GEMINI_KEYS.append(clean_k)
+
+logging.info(f"🔑 Загружено ключей Gemini для ротации: {len(GEMINI_KEYS)}")
 
 current_key_index = 0
 
