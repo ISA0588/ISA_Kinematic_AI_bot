@@ -211,4 +211,101 @@ async def execute_generation(message: aiogram_types.Message, state: FSMContext, 
                     return True
                 except Exception as e:
                     err_str = str(e)
-                    if "429" in err_str or "RESOURCE_
+                    if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                        logging.warning(f"⚠️ [{user_id}] Лимит ключа (429), ротация...")
+                        client = rotate_ai_client()
+                        if not client:
+                            break
+                    else:
+                        raise e
+            return False
+
+        try:
+            success = await asyncio.to_thread(generate_veo_video)
+            if success and os.path.exists(video_filename):
+                await message.answer_video(
+                    video=aiogram_types.FSInputFile(video_filename),
+                    caption=f"✨ Видео успешно создано по промпту:\n«{text_prompt}»",
+                    reply_markup=get_main_menu_keyboard()
+                )
+                os.remove(video_filename)
+            else:
+                await message.answer("❌ Не удалось сгенерировать видео из-за исчерпания лимитов API.", reply_markup=get_main_menu_keyboard())
+        except Exception as e:
+            logging.error(f"❌ [{user_id}] Ошибка Veo: {e}")
+            await message.answer(f"⚠️ **Ошибка при генерации видео:**\n`{e}`", parse_mode="Markdown", reply_markup=get_main_menu_keyboard())
+        finally:
+            if os.path.exists(audio_path):
+                os.remove(audio_path)
+
+    else:
+        status_msg = await message.answer("🖼 Создаю детальный концепт и описание изображения...")
+
+        def generate_photo_concept():
+            client = get_ai_client()
+            if not client:
+                raise ValueError("API-ключи Gemini недоступны.")
+
+            for attempt in range(len(GEMINI_KEYS) or 1):
+                try:
+                    # Используем модель gemini-3.5-flash-lite из документации
+                    interaction = client.interactions.create(
+                        model="gemini-3.5-flash-lite",
+                        input=f"Создай яркое, детальное и живописное визуальное описание (концепт) для художественной иллюстрации на тему: {text_prompt}"
+                    )
+                    if interaction and interaction.output_text:
+                        return interaction.output_text.strip()
+                except Exception as e:
+                    err_str = str(e)
+                    if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                        client = rotate_ai_client()
+                        if not client:
+                            break
+                    else:
+                        raise e
+            return f"Описание для запроса: {text_prompt}"
+
+        try:
+            concept_text = await asyncio.to_thread(generate_photo_concept)
+            await message.answer(
+                f"✨ **Результат генерации концепта:**\n\n{concept_text}",
+                parse_mode="Markdown",
+                reply_markup=get_main_menu_keyboard()
+            )
+        except Exception as e:
+            logging.error(f"❌ [{user_id}] Ошибка генерации концепта фото: {e}")
+            await message.answer(f"⚠️ **Ошибка:**\n`{e}`", parse_mode="Markdown", reply_markup=get_main_menu_keyboard())
+
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
+    
+    await state.clear()
+
+async def handle_ping(request):
+    return web.Response(text="Bot is running and awake!")
+
+async def web_server_runner():
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    app.router.add_get("/ping", handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logging.info(f"🌐 HTTP-сервер для удержания от сна запущен на порту {PORT}")
+
+async def main():
+    await bot.delete_webhook(drop_pending_updates=True)
+    commands = [aiogram_types.BotCommand(command="start", description="Главное меню / Запуск")]
+    await bot.set_my_commands(commands)
+
+    dp.include_router(router)
+    await web_server_runner()
+    logging.info("🚀 Бот успешно запущен и ожидает сообщения (Long Polling)...")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```[cite: 13]
