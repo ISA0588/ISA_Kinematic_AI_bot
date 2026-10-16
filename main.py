@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import time
-from aiohttp import web, ClientSession
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router, types as aiogram_types
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -23,7 +23,6 @@ load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 PORT = int(os.getenv("PORT", 10000))
-UPTIMEROBOT_API_KEY = os.getenv("UPTIMEROBOT_API_KEY", "")
 
 # Настройки платного/бесплатного доступа
 FREE_ACCESS_IDS = {8186927099, 1153214776, 7785086792, 1359780349}
@@ -84,9 +83,6 @@ def get_main_menu_keyboard() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(text="🖼 Создать Фото (ИИ)", callback_data="create_photo"),
                 InlineKeyboardButton(text="🎬 Создать Видео (ИИ)", callback_data="create_video"),
-            ],
-            [
-                InlineKeyboardButton(text="📊 Статус сервера", callback_data="check_status")
             ]
         ]
     )
@@ -107,44 +103,6 @@ async def cmd_start(message: aiogram_types.Message, state: FSMContext):
     await state.clear()
     await message.answer(welcome_text, parse_mode="Markdown", reply_markup=get_main_menu_keyboard())
     await state.set_state(CreationStates.waiting_for_media_type)
-
-# Обработчик проверки статуса через UptimeRobot API
-@router.callback_query(F.data == "check_status")
-async def process_check_status(callback: aiogram_types.CallbackQuery):
-    await callback.answer("Запрашиваю статус серверов...")
-    if not UPTIMEROBOT_API_KEY:
-        await callback.message.answer("⚠️ API-ключ UptimeRobot не настроен в переменных окружения.")
-        return
-
-    url = "https://api.uptimerobot.com/v2/getMonitors"
-    payload = {
-        "api_key": UPTIMEROBOT_API_KEY,
-        "format": "json"
-    }
-    
-    try:
-        async with ClientSession() as session:
-            async with session.post(url, data=payload) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    monitors = data.get("monitors", [])
-                    if not monitors:
-                        await callback.message.answer("📭 Активных мониторов в UptimeRobot не найдено.")
-                        return
-                    
-                    status_report = "📊 **Статус систем (UptimeRobot):**\n\n"
-                    for m in monitors:
-                        name = m.get("friendly_name")
-                        status_code = m.get("status")
-                        status_str = "🟢 Работает (Up)" if status_code == 2.0 or status_code == 2 else "🔴 Спит / Ошибка (Down)"
-                        status_report += f"• **{name}**: {status_str}\n"
-                    
-                    await callback.message.answer(status_report, parse_mode="Markdown")
-                else:
-                    await callback.message.answer("❌ Не удалось получить данные от UptimeRobot API.")
-    except Exception as e:
-        logging.error(f"Ошибка запроса к UptimeRobot API: {e}")
-        await callback.message.answer("⚠️ Произошла ошибка при обращении к сервису мониторинга.")
 
 @router.callback_query(F.data.in_(["create_photo", "create_video"]))
 async def process_media_choice(callback: aiogram_types.CallbackQuery, state: FSMContext):
@@ -221,7 +179,6 @@ async def execute_generation(message: aiogram_types.Message, state: FSMContext, 
     if media_type == "video":
         status_msg = await message.answer("🎬 **Шаг 1/2:** Создаю озвучку и запускаю генерацию видео через Veo...")
         
-        # Генерируем аудио во внутренних целях (без отправки отдельным файлом в чат)
         audio_path = f"output_voice_{user_id}.mp3"
         try:
             communicate = edge_tts.Communicate(text_prompt, "ru-RU-SvetlanaNeural")
@@ -281,7 +238,6 @@ async def execute_generation(message: aiogram_types.Message, state: FSMContext, 
                 os.remove(audio_path)
 
     else:
-        # Режим генерации фото (аудио не создается и не отправляется)
         status_msg = await message.answer("🖼 Генерирую изображение по вашему промпту...")
         photo_filename = f"generated_photo_{user_id}.jpg"
 
@@ -292,20 +248,20 @@ async def execute_generation(message: aiogram_types.Message, state: FSMContext, 
 
             for attempt in range(len(GEMINI_KEYS) or 1):
                 try:
-                    result = client.models.generate_images(
+                    response = client.models.generate_content(
                         model="imagen-3.0-generate-002",
-                        prompt=text_prompt,
-                        config=dict(
-                            number_of_images=1,
-                            output_mime_type="image/jpeg",
-                            aspect_ratio="1:1",
-                        ),
+                        contents=text_prompt,
                     )
-                    for generated_image in result.generated_images:
-                        image_bytes = generated_image.image.image_bytes
-                        with open(photo_filename, "wb") as f:
-                            f.write(image_bytes)
-                        return True
+                    # Извлекаем изображение из ответа generate_content
+                    if hasattr(response, "candidates") and response.candidates:
+                        for candidate in response.candidates:
+                            if hasattr(candidate, "content") and candidate.content.parts:
+                                for part in candidate.content.parts:
+                                    if hasattr(part, "inline_data") and part.inline_data:
+                                        with open(photo_filename, "wb") as f:
+                                            f.write(part.inline_data.data)
+                                        return True
+                    return False
                 except Exception as e:
                     err_str = str(e)
                     if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
