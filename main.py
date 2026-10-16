@@ -17,6 +17,7 @@ from aiogram.types import (
 from dotenv import load_dotenv
 import edge_tts
 from google import genai
+from google.genai import types
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -92,11 +93,11 @@ def get_main_menu_keyboard() -> InlineKeyboardMarkup:
         ]
     )
 
-def get_photo_result_keyboard() -> InlineKeyboardMarkup:
+def get_media_result_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="🔄 Еще вариант", callback_data="regen_photo"),
+                InlineKeyboardButton(text="🔄 Еще вариант", callback_data="regen_media"),
             ],
             [
                 InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_to_menu"),
@@ -182,17 +183,18 @@ async def process_user_prompt(message: aiogram_types.Message, state: FSMContext)
 
     await execute_generation(message, state, media_type, text_prompt)
 
-@router.callback_query(F.data == "regen_photo")
-async def process_regen_photo(callback: aiogram_types.CallbackQuery, state: FSMContext):
+@router.callback_query(F.data == "regen_media")
+async def process_regen_media(callback: aiogram_types.CallbackQuery, state: FSMContext):
     await callback.answer("🔄 Генерирую еще один вариант...")
     data = await state.get_data()
     text_prompt = data.get("text_prompt")
+    media_type = data.get("media_type", "video")
     
     if not text_prompt:
         await callback.message.answer("⚠️ Данные сессии устарели. Нажмите /start для начала.")
         return
         
-    await execute_generation_photo_only(callback.message, state, text_prompt)
+    await execute_generation(callback.message, state, media_type, text_prompt)
 
 @router.pre_checkout_query()
 async def pre_checkout_query_handler(pre_checkout_query: PreCheckoutQuery):
@@ -211,64 +213,12 @@ async def successful_payment_handler(message: aiogram_types.Message, state: FSMC
     await message.answer("✅ Оплата успешно получена! ⭐️ Запускаю генерацию...")
     await execute_generation(message, state, media_type, text_prompt)
 
-async def execute_generation_photo_only(message: aiogram_types.Message, state: FSMContext, text_prompt: str):
-    user_id = message.from_user.id
-    status_msg = await message.answer("🖼 Генерирую изображение через Imagen...")
-    photo_filename = f"generated_photo_{user_id}_{int(time.time())}.jpg"
-
-    def generate_image_file():
-        client = get_ai_client()
-        if not client:
-            raise ValueError("API-ключи Gemini недоступны.")
-
-        for attempt in range(len(GEMINI_KEYS) or 1):
-            try:
-                result = client.models.generate_images(
-                    model='imagen-3.0-generate-002',
-                    prompt=text_prompt,
-                    config=dict(number_of_images=1, output_mime_type="image/jpeg")
-                )
-                for generated_image in result.generated_images:
-                    # Сохраняем байты напрямую без PIL
-                    with open(photo_filename, "wb") as f:
-                        f.write(generated_image.image.image_bytes)
-                    return True
-            except Exception as e:
-                err_str = str(e)
-                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                    client = rotate_ai_client()
-                    if not client:
-                        break
-                else:
-                    raise e
-        return False
-
-    try:
-        success = await asyncio.to_thread(generate_image_file)
-        if success and os.path.exists(photo_filename):
-            await message.answer_photo(
-                photo=aiogram_types.FSInputFile(photo_filename),
-                caption=f"✨ Фото создано по промпту:\n«{text_prompt}»",
-                reply_markup=get_photo_result_keyboard()
-            )
-            os.remove(photo_filename)
-        else:
-            await message.answer("❌ Не удалось сгенерировать изображение из-за лимитов API.", reply_markup=get_main_menu_keyboard())
-    except Exception as e:
-        logging.error(f"❌ [{user_id}] Ошибка генерации фото: {e}")
-        await message.answer(f"⚠️ **Ошибка при генерации фото:**\n`{e}`", parse_mode="Markdown", reply_markup=get_main_menu_keyboard())
-    finally:
-        try:
-            await status_msg.delete()
-        except Exception:
-            pass
-
 async def execute_generation(message: aiogram_types.Message, state: FSMContext, media_type: str, text_prompt: str):
     user_id = message.from_user.id
     logging.info(f"📥 [{user_id}] Запуск процесса для {media_type}: «{text_prompt}»")
     
     if media_type == "video":
-        status_msg = await message.answer("🎬 **Шаг 1/2:** Создаю озвучку и запускаю генерацию видео через Veo...")
+        status_msg = await message.answer("🎬 **Шаг 1/2:** Создаю озвучку и генерирую видео...")
         
         audio_path = f"output_voice_{user_id}.mp3"
         try:
@@ -277,28 +227,28 @@ async def execute_generation(message: aiogram_types.Message, state: FSMContext, 
         except Exception as e:
             logging.warning(f"⚠️ Не удалось создать аудио для видео: {e}")
 
-        video_filename = f"generated_video_{user_id}.mp4"
+        video_filename = f"generated_video_{user_id}_{int(time.time())}.mp4"
 
-        def generate_veo_video():
+        def generate_video_file():
             client = get_ai_client()
             if not client:
                 raise ValueError("API-ключи Gemini недоступны.")
 
             for attempt in range(len(GEMINI_KEYS) or 1):
                 try:
-                    logging.info(f"🎬 [{user_id}] Запрос к Veo (попытка {attempt + 1})...")
-                    operation = client.models.generate_videos(
-                        model="veo-3.1-generate-preview",
-                        source={"prompt": text_prompt},
+                    response = client.models.generate_content(
+                        model='gemini-2.5-flash',
+                        contents=f"Создай качественное видео на тему: {text_prompt}",
+                        config=types.GenerateContentConfig(
+                            response_modalities=["VIDEO"]
+                        )
                     )
-                    while not operation.done:
-                        time.sleep(10)
-                        operation = client.operations.get(operation)
-                        logging.info(f"⏳ [{user_id}] Видео генерируется...")
-
-                    generated_video = operation.response.generated_videos[0]
-                    client.files.download(file=generated_video.video, destination=video_filename)
-                    return True
+                    if response.candidates and response.candidates[0].content.parts:
+                        for part in response.candidates[0].content.parts:
+                            if part.inline_data:
+                                with open(video_filename, "wb") as f:
+                                    f.write(part.inline_data.data)
+                                return True
                 except Exception as e:
                     err_str = str(e)
                     if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
@@ -311,18 +261,18 @@ async def execute_generation(message: aiogram_types.Message, state: FSMContext, 
             return False
 
         try:
-            success = await asyncio.to_thread(generate_veo_video)
+            success = await asyncio.to_thread(generate_video_file)
             if success and os.path.exists(video_filename):
                 await message.answer_video(
                     video=aiogram_types.FSInputFile(video_filename),
                     caption=f"✨ Видео успешно создано по промпту:\n«{text_prompt}»",
-                    reply_markup=get_main_menu_keyboard()
+                    reply_markup=get_media_result_keyboard()
                 )
                 os.remove(video_filename)
             else:
-                await message.answer("❌ Не удалось сгенерировать видео из-за исчерпания лимитов API.", reply_markup=get_main_menu_keyboard())
+                await message.answer("❌ Не удалось сгенерировать видео из-за лимитов API.", reply_markup=get_main_menu_keyboard())
         except Exception as e:
-            logging.error(f"❌ [{user_id}] Ошибка Veo: {e}")
+            logging.error(f"❌ [{user_id}] Ошибка генерации видео: {e}")
             await message.answer(f"⚠️ **Ошибка при генерации видео:**\n`{e}`", parse_mode="Markdown", reply_markup=get_main_menu_keyboard())
         finally:
             if os.path.exists(audio_path):
@@ -331,10 +281,61 @@ async def execute_generation(message: aiogram_types.Message, state: FSMContext, 
                 await status_msg.delete()
             except Exception:
                 pass
-        await state.clear()
 
     else:
-        await execute_generation_photo_only(message, state, text_prompt)
+        status_msg = await message.answer("🖼 Генерирую изображение...")
+        photo_filename = f"generated_photo_{user_id}_{int(time.time())}.jpg"
+
+        def generate_image_file():
+            client = get_ai_client()
+            if not client:
+                raise ValueError("API-ключи Gemini недоступны.")
+
+            for attempt in range(len(GEMINI_KEYS) or 1):
+                try:
+                    response = client.models.generate_content(
+                        model='gemini-2.5-flash-image',
+                        contents=text_prompt,
+                        config=types.GenerateContentConfig(
+                            response_modalities=["IMAGE"]
+                        )
+                    )
+                    if response.candidates and response.candidates[0].content.parts:
+                        for part in response.candidates[0].content.parts:
+                            if part.inline_data:
+                                with open(photo_filename, "wb") as f:
+                                    f.write(part.inline_data.data)
+                                return True
+                except Exception as e:
+                    err_str = str(e)
+                    if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                        client = rotate_ai_client()
+                        if not client:
+                            break
+                    else:
+                        raise e
+            return False
+
+        try:
+            success = await asyncio.to_thread(generate_image_file)
+            if success and os.path.exists(photo_filename):
+                await message.answer_photo(
+                    video=None,
+                    photo=aiogram_types.FSInputFile(photo_filename),
+                    caption=f"✨ Фото создано по промпту:\n«{text_prompt}»",
+                    reply_markup=get_media_result_keyboard()
+                )
+                os.remove(photo_filename)
+            else:
+                await message.answer("❌ Не удалось сгенерировать изображение из-за лимитов API.", reply_markup=get_main_menu_keyboard())
+        except Exception as e:
+            logging.error(f"❌ [{user_id}] Ошибка генерации фото: {e}")
+            await message.answer(f"⚠️ **Ошибка при генерации фото:**\n`{e}`", parse_mode="Markdown", reply_markup=get_main_menu_keyboard())
+        finally:
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
 
 async def handle_ping(request):
     return web.Response(text="Bot is running and awake!")
